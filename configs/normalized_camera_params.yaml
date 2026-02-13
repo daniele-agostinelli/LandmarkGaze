@@ -1,0 +1,15 @@
+image_width: 448
+image_height: 448
+size: (448,448)
+focal_length: 960
+distance: 0.3
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [960., 0., 224.,
+         0., 960., 224.,
+         0., 0., 1.]
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [0., 0., 0., 0., 0.]

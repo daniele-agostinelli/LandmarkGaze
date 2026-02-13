@@ -1,0 +1,15 @@
+device: cpu
+face_detector:
+  mediapipe_max_num_faces: 3
+  mediapipe_static_image_mode: true
+  mediapipe_min_det_conf: 0.8
+  mediapipe_min_track_conf: 0.5
+  padding: 0.0
+gaze_estimator:
+  use_dummy_camera_params: true
+  camera_params: null
+  normalized_camera_params: configs/normalized_camera_params.yaml
+  model_path: null
+image:
+  width: null
+  height: null
