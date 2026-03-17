@@ -7,7 +7,7 @@ The codebase includes scripts for extracting landmarks via MediaPipe, normalizin
 
 The pre-processed landmark datasets (approx. 2.5GB) are too large to host directly in the main branch.
 
-- Download the Data: You can find the extracted `.csv` files in the ... section of this repository.
+- Download the Data: You can find the extracted `.csv` files in the realease section of this repository (https://github.com/daniele-agostinelli/LandmarkGaze/releases/tag/data-v1).
 - Once downloaded, place the `.csv` files into the `datasets/` directory maintaining the folder structure required by the training scripts (e.g., `datasets/XGaze_448/`, `datasets/Gaze360/`).
 
 ## 📂 Repository Structure
