@@ -1,0 +1,69 @@
+# Is Geometry Enough? An Evaluation of Landmark-Based Gaze Estimation
+
+This repository contains the official implementation for the paper "Is Geometry Enough? An Evaluation of Landmark-Based Gaze Estimation". It provides a lightweight, interpretable pipeline for estimating human gaze using sparse geometric features (3D facial landmarks) instead of raw image pixels.
+The codebase includes scripts for extracting landmarks via MediaPipe, normalizing the 3D geometry, and training/evaluating three different regression models (Holistic MLP, Siamese MLP, and XGBoost) across three major datasets (ETH-XGaze, Gaze360, and GazeGene).
+
+## 📊 Data Availability
+
+The pre-processed landmark datasets (approx. 2.5GB) are too large to host directly in the main branch.
+
+- Download the Data: You can find the extracted `.csv` files in the ... section of this repository.
+- Once downloaded, place the `.csv` files into the `datasets/` directory maintaining the folder structure required by the training scripts (e.g., datasets/XGaze_448/, datasets/Gaze360/).
+
+## 📂 Repository Structure
+The repository is modularized into data extraction, model training, benchmarking, and core utility classes. Note that multiple versions of the top-level scripts exist to handle the specific formats of different datasets and models.
+
+### 1. Data Extraction
+Scripts used to process raw image datasets, extract MediaPipe landmarks, perform 3D head pose estimation (PnP), and apply perspective normalization.
+
+- `ExtractDataset_xgaze.py` (ETH-XGaze)
+- `ExtractDataset_gaze360.py` (Gaze360)
+- `ExtractDataset_gazegene.py` (GazeGene)
+
+### 2. Training
+Scripts to train the regressors on the normalized landmark coordinates.
+
+- `Train_MLP.py` (Trains the standard Holistic MLP)
+- `Train_siameseMLP.py` (Trains the binocular Siamese MLP)
+- `Train_XGBoost.py` (Trains the XGBoost regressor)
+
+### 3. Evaluation & Benchmarking
+Scripts to run within-domain and cross-domain evaluations, generating comprehensive performance statistics (`.csv` outputs).
+
+- `Test_on_XGaze.py`
+- `Test_on_Gaze360.py`
+- `Test_on_GazeGene.py`
+
+### 4. Core Modules & Inference
+The underlying classes handling the math, geometric modeling, and estimation pipelines:
+
+- `gaze_estimator_normalized.py` (and its `_siamese` and `_XGBoost` variants): The main inference wrappers that pipe features into the trained models.
+- `normalization_utils.py`: Applies the Zhang et al. (2018) perspective warping to map physical cameras to the normalized virtual space.
+- `face_landmark_estimator.py`: Wrapper for mediapipe.solutions.face_mesh with padding logic for robust detection.
+- `face_model.py`: Defines the 3D semantic layout of the face and anchor points.
+- `camera.py`: Handles camera intrinsics, distortion coefficients, and 3D projection.
+
+## 🚀 Getting Started
+Prerequisites
+Ensure you have Python 3.8+ installed. The primary dependencies are:
+torch
+mediapipe
+opencv-python (cv2)
+numpy, pandas, scipy
+xgboost
+omegaconf (for YAML configuration management)
+
+## Usage
+### 1. Prepare the Data
+Either download the pre-processed `.csv` files from the Releases tab or generate them from scratch using the extraction scripts (in this case original datasets will be needed).
+
+### 2. Train a Model
+Configure your hyperparameters in the target training script (or via OmegaConf YAML files) and execute:
+
+Trained models will be saved to the `models/` directory.
+
+### 3. Run Benchmarks
+To evaluate a model's angular error (in degrees) on a specific dataset.
+
+## 📝 Citation
+If you find this code or our methodology useful in your research, please consider citing our paper.
