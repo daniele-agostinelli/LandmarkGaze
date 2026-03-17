@@ -43,17 +43,14 @@ The underlying classes handling the math, geometric modeling, and estimation pip
 - `face_model.py`: Defines the 3D semantic layout of the face and anchor points.
 - `camera.py`: Handles camera intrinsics, distortion coefficients, and 3D projection.
 
-## 🚀 Getting Started
-Prerequisites
-Ensure you have Python 3.8+ installed. The primary dependencies are:
-torch
-mediapipe
-opencv-python (cv2)
-numpy, pandas, scipy
-xgboost
-omegaconf (for YAML configuration management)
+## 🛠️ Prerequisites
+Source codes were developed and tested with Python 3.12.3 on Ubuntu 24.04 and libraries as detailed in requirements.txt. 
+You can install the used packages via
+```bash
+pip install -r requirements.txt
+```
 
-## Usage
+## 🚀 Usage
 ### 1. Prepare the Data
 Either download the pre-processed `.csv` files from the Releases tab or generate them from scratch using the extraction scripts (in this case original datasets will be needed).
 
