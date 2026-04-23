@@ -1,0 +1,19 @@
+# Linux/NVIDIA profile for remote training.
+# Adjust the cuXXX wheel tag if the target host exposes a different CUDA runtime.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+h5py==3.15.1
+joblib==1.5.2
+mediapipe==0.10.21
+numpy==1.26.4
+omegaconf==2.3.0
+opencv_contrib_python==4.11.0.86
+opencv_python==4.8.1.78
+pandas==2.3.2
+PyYAML==6.0.2
+scikit_learn==1.7.2
+scipy==1.16.2
+seaborn==0.13.2
+torch==2.5.1+cu124; platform_system == "Linux" and platform_machine == "x86_64"
+tqdm==4.67.1
+xgboost==3.1.2
