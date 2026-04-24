@@ -11,6 +11,8 @@ RUN_SIAMESE="${RUN_SIAMESE:-1}"
 RUN_XGBOOST="${RUN_XGBOOST:-0}"
 USE_DDP="${USE_DDP:-1}"
 USE_AMP="${USE_AMP:-1}"
+DDP_TIMEOUT_MINUTES="${DDP_TIMEOUT_MINUTES:-60}"
+export DDP_TIMEOUT_MINUTES
 
 BLENDER_ALL="${BLENDER_ALL:-$ROOT_DIR/datasets/Blender - synthetic/normalized_dataset.csv}"
 BLENDER_TRAIN="${BLENDER_TRAIN:-$ROOT_DIR/datasets/Blender - synthetic/normalized_dataset_TRAIN.csv}"

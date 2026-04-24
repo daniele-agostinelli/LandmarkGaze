@@ -1,5 +1,6 @@
 import argparse
 import os
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -10,13 +11,16 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from dataset_registry import get_dataset_spec
+from feature_cache_utils import build_cache_dir, cache_ready, load_array_cache, read_metadata, write_array_cache
 from training_runtime_utils import (
     cleanup_runtime,
+    get_ddp_timeout,
     is_main_process,
     maybe_parallelize,
     reduce_sum_and_count,
     resolve_device,
     setup_runtime,
+    wait_for_all_ranks,
     unwrap_state_dict,
 )
 
@@ -85,6 +89,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout-rate", type=float, default=None)
     parser.add_argument("--augmentation-noise-std", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
+    parser.add_argument(
+        "--cache-dir",
+        default=os.path.join(".cache", "feature_tensors"),
+        help="Directory for precomputed feature caches shared across runs/ranks.",
+    )
     return parser.parse_args()
 
 
@@ -123,38 +132,111 @@ def apply_overrides(config: Config, args: argparse.Namespace) -> None:
         config.AUGMENTATION_NOISE_STD = args.augmentation_noise_std
 
 
+def build_mlp_arrays(data_frame: pd.DataFrame, config: Config) -> tuple[np.ndarray, np.ndarray]:
+    lm_cols_x = [f"{idx}_x" for idx in config.LANDMARK_INDICES]
+    lm_cols_y = [f"{idx}_y" for idx in config.LANDMARK_INDICES]
+    eye_anchor_ids = [
+        config.LEFT_INNER_CORNER,
+        config.LEFT_OUTER_CORNER,
+        config.RIGHT_INNER_CORNER,
+        config.RIGHT_OUTER_CORNER,
+    ]
+    eye_lm_cols_x = [f"{idx}_x" for idx in eye_anchor_ids]
+    eye_lm_cols_y = [f"{idx}_y" for idx in eye_anchor_ids]
+
+    xs = data_frame[lm_cols_x].to_numpy(dtype=np.float32)
+    ys = data_frame[lm_cols_y].to_numpy(dtype=np.float32)
+    xs_eye = data_frame[eye_lm_cols_x].to_numpy(dtype=np.float32)
+    ys_eye = data_frame[eye_lm_cols_y].to_numpy(dtype=np.float32)
+
+    centroid_x = np.mean(xs_eye, axis=1, keepdims=True)
+    centroid_y = np.mean(ys_eye, axis=1, keepdims=True)
+    xs_norm = (xs - centroid_x) / config.SCALE_FACTOR
+    ys_norm = (ys - centroid_y) / config.SCALE_FACTOR
+
+    features = np.empty((len(data_frame), len(config.LANDMARK_INDICES) * 2), dtype=np.float32)
+    features[:, 0::2] = xs_norm
+    features[:, 1::2] = ys_norm
+
+    targets = data_frame[["gaze_x", "gaze_y", "gaze_z"]].to_numpy(dtype=np.float32)
+    targets /= np.clip(np.linalg.norm(targets, axis=1, keepdims=True), 1e-8, None)
+    return features, targets
+
+
+def prepare_mlp_dataset(
+    csv_path: str,
+    config: Config,
+    cache_dir_root: str,
+    split_name: str,
+    *,
+    is_train: bool,
+    rank: int,
+    distributed: bool,
+) -> tuple["GazeDataset", int, str]:
+    cache_dir = build_cache_dir(
+        csv_path,
+        cache_dir_root,
+        "mlp",
+        (
+            "v1",
+            config.LANDMARK_INDICES,
+            config.SCALE_FACTOR,
+        ),
+    )
+    array_names = ("features", "targets")
+
+    if is_main_process(rank):
+        if cache_ready(cache_dir, array_names):
+            metadata = read_metadata(cache_dir)
+            print(f"Using cached {split_name} tensors from {cache_dir} ({metadata['num_rows']} rows).")
+        else:
+            print(f"Loading {split_name} CSV: {csv_path}")
+            data_frame = pd.read_csv(csv_path, sep=";")
+            print(f"Loaded {len(data_frame)} {split_name} rows.")
+            print(f"Precomputing {split_name} landmark features...")
+            features, targets = build_mlp_arrays(data_frame, config)
+            del data_frame
+            write_array_cache(
+                cache_dir,
+                {"features": features, "targets": targets},
+                {
+                    "csv_path": os.path.abspath(csv_path),
+                    "num_rows": int(features.shape[0]),
+                    "split_name": split_name,
+                },
+            )
+
+    wait_for_all_ranks(distributed)
+
+    if not cache_ready(cache_dir, array_names):
+        raise RuntimeError(f"{split_name.capitalize()} cache is missing or incomplete at {cache_dir}.")
+
+    metadata = read_metadata(cache_dir)
+    arrays = load_array_cache(cache_dir, array_names)
+    dataset = GazeDataset(config, is_train=is_train, features=arrays["features"], targets=arrays["targets"])
+    return dataset, int(metadata["num_rows"]), cache_dir
+
+
 class GazeDataset(Dataset):
-    def __init__(self, data_frame: pd.DataFrame, config: Config, is_train: bool = False):
+    def __init__(
+        self,
+        config: Config,
+        is_train: bool = False,
+        *,
+        data_frame: Optional[pd.DataFrame] = None,
+        features: Optional[np.ndarray] = None,
+        targets: Optional[np.ndarray] = None,
+    ):
         self.config = config
         self.is_train = is_train
 
-        lm_cols_x = [f"{idx}_x" for idx in config.LANDMARK_INDICES]
-        lm_cols_y = [f"{idx}_y" for idx in config.LANDMARK_INDICES]
-        eye_anchor_ids = [
-            config.LEFT_INNER_CORNER,
-            config.LEFT_OUTER_CORNER,
-            config.RIGHT_INNER_CORNER,
-            config.RIGHT_OUTER_CORNER,
-        ]
-        eye_lm_cols_x = [f"{idx}_x" for idx in eye_anchor_ids]
-        eye_lm_cols_y = [f"{idx}_y" for idx in eye_anchor_ids]
+        if features is None or targets is None:
+            if data_frame is None:
+                raise ValueError("Either data_frame or both features and targets must be provided.")
+            features, targets = build_mlp_arrays(data_frame, config)
 
-        xs = data_frame[lm_cols_x].to_numpy(dtype=np.float32)
-        ys = data_frame[lm_cols_y].to_numpy(dtype=np.float32)
-        xs_eye = data_frame[eye_lm_cols_x].to_numpy(dtype=np.float32)
-        ys_eye = data_frame[eye_lm_cols_y].to_numpy(dtype=np.float32)
-
-        centroid_x = np.mean(xs_eye, axis=1, keepdims=True)
-        centroid_y = np.mean(ys_eye, axis=1, keepdims=True)
-        xs_norm = (xs - centroid_x) / config.SCALE_FACTOR
-        ys_norm = (ys - centroid_y) / config.SCALE_FACTOR
-
-        self.features = np.empty((len(data_frame), len(config.LANDMARK_INDICES) * 2), dtype=np.float32)
-        self.features[:, 0::2] = xs_norm
-        self.features[:, 1::2] = ys_norm
-
-        self.targets = data_frame[["gaze_x", "gaze_y", "gaze_z"]].to_numpy(dtype=np.float32)
-        self.targets /= np.clip(np.linalg.norm(self.targets, axis=1, keepdims=True), 1e-8, None)
+        self.features = features
+        self.targets = targets
 
     def __len__(self) -> int:
         return len(self.features)
@@ -268,20 +350,26 @@ def main() -> None:
                 f"Data files not found at {config.TRAIN_FILE} or {config.VALID_FILE}"
             )
 
+        train_dataset, train_rows, _train_cache_dir = prepare_mlp_dataset(
+            config.TRAIN_FILE,
+            config,
+            args.cache_dir,
+            "training",
+            is_train=True,
+            rank=rank,
+            distributed=distributed,
+        )
+        valid_dataset, valid_rows, _valid_cache_dir = prepare_mlp_dataset(
+            config.VALID_FILE,
+            config,
+            args.cache_dir,
+            "validation",
+            is_train=False,
+            rank=rank,
+            distributed=distributed,
+        )
         if is_main_process(rank):
-            print(f"Loading training CSV: {config.TRAIN_FILE}")
-        train_df = pd.read_csv(config.TRAIN_FILE, sep=";")
-        if is_main_process(rank):
-            print(f"Loading validation CSV: {config.VALID_FILE}")
-        valid_df = pd.read_csv(config.VALID_FILE, sep=";")
-        if is_main_process(rank):
-            print(f"Loaded {len(train_df)} training rows and {len(valid_df)} validation rows.")
-            print("Precomputing normalized landmark features...")
-
-        train_dataset = GazeDataset(train_df, config, True)
-        valid_dataset = GazeDataset(valid_df, config, False)
-        del train_df
-        del valid_df
+            print(f"Prepared {train_rows} training rows and {valid_rows} validation rows.")
 
         train_sampler = None
         valid_sampler = None
@@ -308,6 +396,10 @@ def main() -> None:
         )
         if is_main_process(rank):
             print("Data loaders ready.")
+            if distributed:
+                print(f"Waiting for all DDP ranks before model setup (timeout={get_ddp_timeout()}).")
+
+        wait_for_all_ranks(distributed)
 
         input_dim = len(config.LANDMARK_INDICES) * 2
         model = GazeNetVector(

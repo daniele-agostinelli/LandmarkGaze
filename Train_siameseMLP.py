@@ -1,5 +1,6 @@
 import argparse
 import os
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -10,12 +11,15 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from dataset_registry import get_dataset_spec
+from feature_cache_utils import build_cache_dir, cache_ready, load_array_cache, read_metadata, write_array_cache
 from training_runtime_utils import (
     cleanup_runtime,
+    get_ddp_timeout,
     is_main_process,
     maybe_parallelize,
     reduce_sum_and_count,
     setup_runtime,
+    wait_for_all_ranks,
     unwrap_state_dict,
 )
 
@@ -84,6 +88,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout-rate", type=float, default=None)
     parser.add_argument("--augmentation-noise-std", type=float, default=None)
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
+    parser.add_argument(
+        "--cache-dir",
+        default=os.path.join(".cache", "feature_tensors"),
+        help="Directory for precomputed feature caches shared across runs/ranks.",
+    )
     return parser.parse_args()
 
 
@@ -124,67 +133,151 @@ def apply_overrides(config: Config, args: argparse.Namespace) -> None:
         config.AUGMENTATION_NOISE_STD = args.augmentation_noise_std
 
 
+def build_siamese_arrays(data_frame: pd.DataFrame, config: Config) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    l_cols_x = [f"{idx}_x" for idx in config.LEFT_EYE_LANDMARKS]
+    l_cols_y = [f"{idx}_y" for idx in config.LEFT_EYE_LANDMARKS]
+    r_cols_x = [f"{idx}_x" for idx in config.RIGHT_EYE_LANDMARKS]
+    r_cols_y = [f"{idx}_y" for idx in config.RIGHT_EYE_LANDMARKS]
+    h_cols_x = [f"{idx}_x" for idx in config.HEAD_ANCHORS]
+    h_cols_y = [f"{idx}_y" for idx in config.HEAD_ANCHORS]
+
+    l_xs = data_frame[l_cols_x].to_numpy(dtype=np.float32)
+    l_ys = data_frame[l_cols_y].to_numpy(dtype=np.float32)
+    r_xs = data_frame[r_cols_x].to_numpy(dtype=np.float32)
+    r_ys = data_frame[r_cols_y].to_numpy(dtype=np.float32)
+
+    l_in = data_frame[[f"{config.LEFT_INNER_CORNER}_x", f"{config.LEFT_INNER_CORNER}_y"]].to_numpy(dtype=np.float32)
+    l_out = data_frame[[f"{config.LEFT_OUTER_CORNER}_x", f"{config.LEFT_OUTER_CORNER}_y"]].to_numpy(dtype=np.float32)
+    r_in = data_frame[[f"{config.RIGHT_INNER_CORNER}_x", f"{config.RIGHT_INNER_CORNER}_y"]].to_numpy(dtype=np.float32)
+    r_out = data_frame[[f"{config.RIGHT_OUTER_CORNER}_x", f"{config.RIGHT_OUTER_CORNER}_y"]].to_numpy(dtype=np.float32)
+
+    l_center_x = (l_in[:, [0]] + l_out[:, [0]]) / 2.0
+    l_center_y = (l_in[:, [1]] + l_out[:, [1]]) / 2.0
+    r_center_x = (r_in[:, [0]] + r_out[:, [0]]) / 2.0
+    r_center_y = (r_in[:, [1]] + r_out[:, [1]]) / 2.0
+
+    feat_left = np.empty((len(data_frame), len(config.LEFT_EYE_LANDMARKS) * 2), dtype=np.float32)
+    feat_left[:, 0::2] = (l_xs - l_center_x) / config.SCALE_FACTOR
+    feat_left[:, 1::2] = (l_ys - l_center_y) / config.SCALE_FACTOR
+
+    feat_right = np.empty((len(data_frame), len(config.RIGHT_EYE_LANDMARKS) * 2), dtype=np.float32)
+    feat_right[:, 0::2] = (r_xs - r_center_x) / config.SCALE_FACTOR
+    feat_right[:, 1::2] = (r_ys - r_center_y) / config.SCALE_FACTOR
+
+    relative_pos = np.empty((len(data_frame), 2), dtype=np.float32)
+    relative_pos[:, 0] = ((r_center_x - l_center_x)[:, 0]) / config.SCALE_FACTOR
+    relative_pos[:, 1] = ((r_center_y - l_center_y)[:, 0]) / config.SCALE_FACTOR
+
+    head_x = data_frame[h_cols_x].to_numpy(dtype=np.float32)
+    head_y = data_frame[h_cols_y].to_numpy(dtype=np.float32)
+    face_center_x = (l_center_x + r_center_x) / 2.0
+    face_center_y = (l_center_y + r_center_y) / 2.0
+
+    feat_head = np.empty((len(data_frame), len(config.HEAD_ANCHORS) * 2), dtype=np.float32)
+    feat_head[:, 0::2] = (head_x - face_center_x) / config.SCALE_FACTOR
+    feat_head[:, 1::2] = (head_y - face_center_y) / config.SCALE_FACTOR
+
+    targets = data_frame[["gaze_x", "gaze_y", "gaze_z"]].to_numpy(dtype=np.float32)
+    targets /= np.clip(np.linalg.norm(targets, axis=1, keepdims=True), 1e-8, None)
+    return feat_left, feat_right, relative_pos, feat_head, targets
+
+
+def prepare_siamese_dataset(
+    csv_path: str,
+    config: Config,
+    cache_dir_root: str,
+    split_name: str,
+    *,
+    is_train: bool,
+    rank: int,
+    distributed: bool,
+) -> tuple["SiameseGazeDataset", int, str]:
+    cache_dir = build_cache_dir(
+        csv_path,
+        cache_dir_root,
+        "siamese",
+        (
+            "v1",
+            config.LEFT_EYE_LANDMARKS,
+            config.RIGHT_EYE_LANDMARKS,
+            config.HEAD_ANCHORS,
+            config.SCALE_FACTOR,
+        ),
+    )
+    array_names = ("feat_left", "feat_right", "relative_pos", "feat_head", "targets")
+
+    if is_main_process(rank):
+        if cache_ready(cache_dir, array_names):
+            metadata = read_metadata(cache_dir)
+            print(f"Using cached {split_name} tensors from {cache_dir} ({metadata['num_rows']} rows).")
+        else:
+            print(f"Loading {split_name} CSV: {csv_path}")
+            data_frame = pd.read_csv(csv_path, sep=";")
+            print(f"Loaded {len(data_frame)} {split_name} rows.")
+            print(f"Precomputing {split_name} landmark features...")
+            feat_left, feat_right, relative_pos, feat_head, targets = build_siamese_arrays(data_frame, config)
+            del data_frame
+            write_array_cache(
+                cache_dir,
+                {
+                    "feat_left": feat_left,
+                    "feat_right": feat_right,
+                    "relative_pos": relative_pos,
+                    "feat_head": feat_head,
+                    "targets": targets,
+                },
+                {
+                    "csv_path": os.path.abspath(csv_path),
+                    "num_rows": int(targets.shape[0]),
+                    "split_name": split_name,
+                },
+            )
+
+    wait_for_all_ranks(distributed)
+
+    if not cache_ready(cache_dir, array_names):
+        raise RuntimeError(f"{split_name.capitalize()} cache is missing or incomplete at {cache_dir}.")
+
+    metadata = read_metadata(cache_dir)
+    arrays = load_array_cache(cache_dir, array_names)
+    dataset = SiameseGazeDataset(
+        config,
+        is_train=is_train,
+        feat_left=arrays["feat_left"],
+        feat_right=arrays["feat_right"],
+        relative_pos=arrays["relative_pos"],
+        feat_head=arrays["feat_head"],
+        targets=arrays["targets"],
+    )
+    return dataset, int(metadata["num_rows"]), cache_dir
+
+
 class SiameseGazeDataset(Dataset):
-    def __init__(self, data_frame: pd.DataFrame, config: Config, is_train: bool = False):
+    def __init__(
+        self,
+        config: Config,
+        is_train: bool = False,
+        *,
+        data_frame: Optional[pd.DataFrame] = None,
+        feat_left: Optional[np.ndarray] = None,
+        feat_right: Optional[np.ndarray] = None,
+        relative_pos: Optional[np.ndarray] = None,
+        feat_head: Optional[np.ndarray] = None,
+        targets: Optional[np.ndarray] = None,
+    ):
         self.config = config
         self.is_train = is_train
 
-        l_cols_x = [f"{idx}_x" for idx in config.LEFT_EYE_LANDMARKS]
-        l_cols_y = [f"{idx}_y" for idx in config.LEFT_EYE_LANDMARKS]
-        r_cols_x = [f"{idx}_x" for idx in config.RIGHT_EYE_LANDMARKS]
-        r_cols_y = [f"{idx}_y" for idx in config.RIGHT_EYE_LANDMARKS]
-        h_cols_x = [f"{idx}_x" for idx in config.HEAD_ANCHORS]
-        h_cols_y = [f"{idx}_y" for idx in config.HEAD_ANCHORS]
+        if any(value is None for value in (feat_left, feat_right, relative_pos, feat_head, targets)):
+            if data_frame is None:
+                raise ValueError("Either data_frame or all cached feature arrays must be provided.")
+            feat_left, feat_right, relative_pos, feat_head, targets = build_siamese_arrays(data_frame, config)
 
-        l_xs = data_frame[l_cols_x].to_numpy(dtype=np.float32)
-        l_ys = data_frame[l_cols_y].to_numpy(dtype=np.float32)
-        r_xs = data_frame[r_cols_x].to_numpy(dtype=np.float32)
-        r_ys = data_frame[r_cols_y].to_numpy(dtype=np.float32)
-
-        l_in = data_frame[[f"{config.LEFT_INNER_CORNER}_x", f"{config.LEFT_INNER_CORNER}_y"]].to_numpy(
-            dtype=np.float32
-        )
-        l_out = data_frame[[f"{config.LEFT_OUTER_CORNER}_x", f"{config.LEFT_OUTER_CORNER}_y"]].to_numpy(
-            dtype=np.float32
-        )
-        r_in = data_frame[[f"{config.RIGHT_INNER_CORNER}_x", f"{config.RIGHT_INNER_CORNER}_y"]].to_numpy(
-            dtype=np.float32
-        )
-        r_out = data_frame[[f"{config.RIGHT_OUTER_CORNER}_x", f"{config.RIGHT_OUTER_CORNER}_y"]].to_numpy(
-            dtype=np.float32
-        )
-
-        l_center_x = (l_in[:, [0]] + l_out[:, [0]]) / 2.0
-        l_center_y = (l_in[:, [1]] + l_out[:, [1]]) / 2.0
-        r_center_x = (r_in[:, [0]] + r_out[:, [0]]) / 2.0
-        r_center_y = (r_in[:, [1]] + r_out[:, [1]]) / 2.0
-
-        self.feat_left = np.empty((len(data_frame), len(config.LEFT_EYE_LANDMARKS) * 2), dtype=np.float32)
-        self.feat_left[:, 0::2] = (l_xs - l_center_x) / config.SCALE_FACTOR
-        self.feat_left[:, 1::2] = (l_ys - l_center_y) / config.SCALE_FACTOR
-
-        self.feat_right = np.empty((len(data_frame), len(config.RIGHT_EYE_LANDMARKS) * 2), dtype=np.float32)
-        self.feat_right[:, 0::2] = (r_xs - r_center_x) / config.SCALE_FACTOR
-        self.feat_right[:, 1::2] = (r_ys - r_center_y) / config.SCALE_FACTOR
-
-        avg_scale = config.SCALE_FACTOR
-        self.relative_pos = np.empty((len(data_frame), 2), dtype=np.float32)
-        self.relative_pos[:, 0] = ((r_center_x - l_center_x)[:, 0]) / avg_scale
-        self.relative_pos[:, 1] = ((r_center_y - l_center_y)[:, 0]) / avg_scale
-
-        head_x = data_frame[h_cols_x].to_numpy(dtype=np.float32)
-        head_y = data_frame[h_cols_y].to_numpy(dtype=np.float32)
-        face_center_x = (l_center_x + r_center_x) / 2.0
-        face_center_y = (l_center_y + r_center_y) / 2.0
-        head_xn = (head_x - face_center_x) / avg_scale
-        head_yn = (head_y - face_center_y) / avg_scale
-
-        self.feat_head = np.empty((len(data_frame), len(config.HEAD_ANCHORS) * 2), dtype=np.float32)
-        self.feat_head[:, 0::2] = head_xn
-        self.feat_head[:, 1::2] = head_yn
-
-        self.targets = data_frame[["gaze_x", "gaze_y", "gaze_z"]].to_numpy(dtype=np.float32)
-        self.targets /= np.clip(np.linalg.norm(self.targets, axis=1, keepdims=True), 1e-8, None)
+        self.feat_left = feat_left
+        self.feat_right = feat_right
+        self.relative_pos = relative_pos
+        self.feat_head = feat_head
+        self.targets = targets
 
     def __len__(self) -> int:
         return len(self.targets)
@@ -332,20 +425,26 @@ def main() -> None:
                 f"Data files not found at {config.TRAIN_FILE} or {config.VALID_FILE}"
             )
 
+        train_dataset, train_rows, _train_cache_dir = prepare_siamese_dataset(
+            config.TRAIN_FILE,
+            config,
+            args.cache_dir,
+            "training",
+            is_train=True,
+            rank=rank,
+            distributed=distributed,
+        )
+        valid_dataset, valid_rows, _valid_cache_dir = prepare_siamese_dataset(
+            config.VALID_FILE,
+            config,
+            args.cache_dir,
+            "validation",
+            is_train=False,
+            rank=rank,
+            distributed=distributed,
+        )
         if is_main_process(rank):
-            print(f"Loading training CSV: {config.TRAIN_FILE}")
-        train_df = pd.read_csv(config.TRAIN_FILE, sep=";")
-        if is_main_process(rank):
-            print(f"Loading validation CSV: {config.VALID_FILE}")
-        valid_df = pd.read_csv(config.VALID_FILE, sep=";")
-        if is_main_process(rank):
-            print(f"Loaded {len(train_df)} training rows and {len(valid_df)} validation rows.")
-            print("Precomputing normalized landmark features...")
-
-        train_dataset = SiameseGazeDataset(train_df, config, True)
-        valid_dataset = SiameseGazeDataset(valid_df, config, False)
-        del train_df
-        del valid_df
+            print(f"Prepared {train_rows} training rows and {valid_rows} validation rows.")
 
         train_sampler = None
         valid_sampler = None
@@ -372,6 +471,10 @@ def main() -> None:
         )
         if is_main_process(rank):
             print("Data loaders ready.")
+            if distributed:
+                print(f"Waiting for all DDP ranks before model setup (timeout={get_ddp_timeout()}).")
+
+        wait_for_all_ranks(distributed)
 
         input_dim_eye = len(config.LEFT_EYE_LANDMARKS) * 2
         model = SiameseGazeNet(input_dim_eye, config).to(device)

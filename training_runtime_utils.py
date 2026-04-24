@@ -1,10 +1,19 @@
 import os
+from datetime import timedelta
 from typing import Tuple
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
+
+
+DEFAULT_DDP_TIMEOUT_MINUTES = 60
+
+
+def get_ddp_timeout() -> timedelta:
+    timeout_minutes = int(os.environ.get("DDP_TIMEOUT_MINUTES", str(DEFAULT_DDP_TIMEOUT_MINUTES)))
+    return timedelta(minutes=timeout_minutes)
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -42,7 +51,7 @@ def setup_runtime(device_arg: str, distributed: bool) -> Tuple[torch.device, boo
     local_rank = int(os.environ["LOCAL_RANK"])
 
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=get_ddp_timeout())
     device = torch.device("cuda", local_rank)
     return device, True, rank, world_size, local_rank
 
@@ -85,6 +94,11 @@ def reduce_sum_and_count(
     stats = torch.tensor([total_value, float(total_count)], dtype=torch.float64, device=device)
     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
     return float(stats[0].item()), int(stats[1].item())
+
+
+def wait_for_all_ranks(distributed: bool) -> None:
+    if distributed:
+        dist.barrier()
 
 
 def cleanup_runtime(distributed: bool) -> None:
