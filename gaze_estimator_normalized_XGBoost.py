@@ -16,6 +16,23 @@ from Train_MLP import Config as TrainConfig
 logger = logging.getLogger(__name__)
 
 
+def _resolve_camera_params_path(config: DictConfig) -> str:
+    camera_params = config.gaze_estimator.get("camera_params", None)
+    if camera_params is not None:
+        return camera_params
+
+    normalized_camera_params = config.gaze_estimator.get("normalized_camera_params", None)
+    if normalized_camera_params is None:
+        raise ValueError(
+            "Both gaze_estimator.camera_params and normalized_camera_params are missing."
+        )
+
+    logger.info(
+        "gaze_estimator.camera_params is missing; falling back to normalized_camera_params."
+    )
+    return normalized_camera_params
+
+
 class GazeEstimatorXGBoost:
     """
     Estimates gaze using the XGBoost regressor.
@@ -24,7 +41,7 @@ class GazeEstimatorXGBoost:
     def __init__(self, config: DictConfig):
         self._config = config
         self.face_model3d = FaceModel()
-        self.camera = Camera(config.gaze_estimator.camera_params)
+        self.camera = Camera(_resolve_camera_params_path(config))
         self._landmark_estimator = None
         try:
             self._landmark_estimator = LandmarkEstimator(config)
