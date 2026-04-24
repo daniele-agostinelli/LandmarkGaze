@@ -9,6 +9,8 @@ RUN_SPLIT="${RUN_SPLIT:-auto}"
 RUN_MLP="${RUN_MLP:-1}"
 RUN_SIAMESE="${RUN_SIAMESE:-1}"
 RUN_XGBOOST="${RUN_XGBOOST:-0}"
+USE_DDP="${USE_DDP:-1}"
+USE_AMP="${USE_AMP:-1}"
 
 BLENDER_ALL="${BLENDER_ALL:-$ROOT_DIR/datasets/Blender - synthetic/normalized_dataset.csv}"
 BLENDER_TRAIN="${BLENDER_TRAIN:-$ROOT_DIR/datasets/Blender - synthetic/normalized_dataset_TRAIN.csv}"
@@ -25,9 +27,18 @@ MLP_GPU_SET="${MLP_GPU_SET:-0,1,2,3}"
 SIAMESE_GPU_SET="${SIAMESE_GPU_SET:-4,5,6}"
 MLP_BATCH_SIZE="${MLP_BATCH_SIZE:-2048}"
 SIAMESE_BATCH_SIZE="${SIAMESE_BATCH_SIZE:-1024}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-0}"
+MLP_MASTER_PORT="${MLP_MASTER_PORT:-29501}"
+SIAMESE_MASTER_PORT="${SIAMESE_MASTER_PORT:-29502}"
 
 mkdir -p "$LOG_DIR"
+
+count_visible_gpus() {
+  local gpu_csv="$1"
+  local gpu_ids=()
+  IFS=',' read -r -a gpu_ids <<< "$gpu_csv"
+  echo "${#gpu_ids[@]}"
+}
 
 need_split=0
 for split_file in "$BLENDER_TRAIN" "$BLENDER_VALID" "$BLENDER_TEST"; do
@@ -61,14 +72,39 @@ siamese_pid=""
 if [[ "$RUN_MLP" == "1" ]]; then
   (
     export CUDA_VISIBLE_DEVICES="$MLP_GPU_SET"
-    "$PYTHON_BIN" "$ROOT_DIR/Train_MLP.py" \
-      --dataset blender \
-      --device cuda \
-      --multi-gpu \
-      --batch-size "$MLP_BATCH_SIZE" \
-      --num-workers "$NUM_WORKERS" \
-      --model-save-path "$ROOT_DIR/models/blender_MLP.pth" \
-      > "$LOG_DIR/blender_mlp_train.log" 2>&1
+    mlp_gpu_count="$(count_visible_gpus "$MLP_GPU_SET")"
+    if [[ "$USE_DDP" == "1" && "$mlp_gpu_count" -gt 1 ]]; then
+      mlp_train_cmd=(
+        "$PYTHON_BIN" -m torch.distributed.run
+        --standalone
+        --nproc_per_node "$mlp_gpu_count"
+        --master-port "$MLP_MASTER_PORT"
+        "$ROOT_DIR/Train_MLP.py"
+        --dataset blender
+        --device cuda
+        --distributed
+        --batch-size "$MLP_BATCH_SIZE"
+        --num-workers "$NUM_WORKERS"
+        --model-save-path "$ROOT_DIR/models/blender_MLP.pth"
+      )
+    else
+      mlp_train_cmd=(
+        "$PYTHON_BIN" "$ROOT_DIR/Train_MLP.py"
+        --dataset blender
+        --device cuda
+        --batch-size "$MLP_BATCH_SIZE"
+        --num-workers "$NUM_WORKERS"
+        --model-save-path "$ROOT_DIR/models/blender_MLP.pth"
+      )
+      if [[ "$mlp_gpu_count" -gt 1 ]]; then
+        mlp_train_cmd+=(--multi-gpu)
+      fi
+    fi
+    if [[ "$USE_AMP" == "1" ]]; then
+      mlp_train_cmd+=(--amp)
+    fi
+
+    "${mlp_train_cmd[@]}" > "$LOG_DIR/blender_mlp_train.log" 2>&1
 
     "$PYTHON_BIN" "$ROOT_DIR/Run_CrossDomain_MLP.py" \
       --model-path "$ROOT_DIR/models/blender_MLP.pth" \
@@ -85,14 +121,39 @@ fi
 if [[ "$RUN_SIAMESE" == "1" ]]; then
   (
     export CUDA_VISIBLE_DEVICES="$SIAMESE_GPU_SET"
-    "$PYTHON_BIN" "$ROOT_DIR/Train_siameseMLP.py" \
-      --dataset blender \
-      --device cuda \
-      --multi-gpu \
-      --batch-size "$SIAMESE_BATCH_SIZE" \
-      --num-workers "$NUM_WORKERS" \
-      --model-save-path "$ROOT_DIR/models/blender_siameseMLP.pth" \
-      > "$LOG_DIR/blender_siamese_train.log" 2>&1
+    siamese_gpu_count="$(count_visible_gpus "$SIAMESE_GPU_SET")"
+    if [[ "$USE_DDP" == "1" && "$siamese_gpu_count" -gt 1 ]]; then
+      siamese_train_cmd=(
+        "$PYTHON_BIN" -m torch.distributed.run
+        --standalone
+        --nproc_per_node "$siamese_gpu_count"
+        --master-port "$SIAMESE_MASTER_PORT"
+        "$ROOT_DIR/Train_siameseMLP.py"
+        --dataset blender
+        --device cuda
+        --distributed
+        --batch-size "$SIAMESE_BATCH_SIZE"
+        --num-workers "$NUM_WORKERS"
+        --model-save-path "$ROOT_DIR/models/blender_siameseMLP.pth"
+      )
+    else
+      siamese_train_cmd=(
+        "$PYTHON_BIN" "$ROOT_DIR/Train_siameseMLP.py"
+        --dataset blender
+        --device cuda
+        --batch-size "$SIAMESE_BATCH_SIZE"
+        --num-workers "$NUM_WORKERS"
+        --model-save-path "$ROOT_DIR/models/blender_siameseMLP.pth"
+      )
+      if [[ "$siamese_gpu_count" -gt 1 ]]; then
+        siamese_train_cmd+=(--multi-gpu)
+      fi
+    fi
+    if [[ "$USE_AMP" == "1" ]]; then
+      siamese_train_cmd+=(--amp)
+    fi
+
+    "${siamese_train_cmd[@]}" > "$LOG_DIR/blender_siamese_train.log" 2>&1
 
     "$PYTHON_BIN" "$ROOT_DIR/Run_CrossDomain_Siamese.py" \
       --model-path "$ROOT_DIR/models/blender_siameseMLP.pth" \

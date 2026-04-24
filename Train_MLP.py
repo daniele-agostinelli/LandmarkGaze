@@ -7,8 +7,18 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 from dataset_registry import get_dataset_spec
+from training_runtime_utils import (
+    cleanup_runtime,
+    is_main_process,
+    maybe_parallelize,
+    reduce_sum_and_count,
+    resolve_device,
+    setup_runtime,
+    unwrap_state_dict,
+)
 
 
 DEFAULT_DATASET = get_dataset_spec("gaze360")
@@ -63,6 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-save-path", default=None, help="Output checkpoint path.")
     parser.add_argument("--device", default="auto", help='Device string, e.g. "auto", "cuda", "cuda:0", "cpu".')
     parser.add_argument("--multi-gpu", action="store_true", help="Enable torch.nn.DataParallel on all visible GPUs.")
+    parser.add_argument("--distributed", action="store_true", help="Enable torch.distributed DDP (launch with torchrun).")
+    parser.add_argument("--amp", action="store_true", help="Enable CUDA mixed precision.")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
@@ -109,29 +121,6 @@ def apply_overrides(config: Config, args: argparse.Namespace) -> None:
         config.DROPOUT_RATE = args.dropout_rate
     if args.augmentation_noise_std is not None:
         config.AUGMENTATION_NOISE_STD = args.augmentation_noise_std
-
-
-def resolve_device(device_arg: str) -> torch.device:
-    if device_arg == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    device = torch.device(device_arg)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but not available.")
-    return device
-
-
-def maybe_dataparallel(model: nn.Module, device: torch.device, enabled: bool) -> nn.Module:
-    if enabled and device.type == "cuda" and torch.cuda.device_count() > 1:
-        print(f"DataParallel enabled across {torch.cuda.device_count()} GPUs.")
-        return nn.DataParallel(model)
-    return model
-
-
-def unwrap_state_dict(model: nn.Module):
-    if isinstance(model, nn.DataParallel):
-        return model.module.state_dict()
-    return model.state_dict()
 
 
 class GazeDataset(Dataset):
@@ -250,124 +239,195 @@ class GazeAngularLoss(nn.Module):
 
 def main() -> None:
     args = parse_args()
+    if args.distributed and args.multi_gpu:
+        raise ValueError("Use either --distributed (DDP) or --multi-gpu (DataParallel), not both.")
+
     config = Config()
     apply_overrides(config, args)
 
     torch.manual_seed(config.RANDOM_STATE)
     np.random.seed(config.RANDOM_STATE)
 
-    device = resolve_device(args.device)
-    print(f"Using {device}")
+    device, distributed, rank, world_size, _local_rank = setup_runtime(args.device, args.distributed)
+    amp_enabled = args.amp and device.type == "cuda"
 
-    if not os.path.exists(config.TRAIN_FILE) or not os.path.exists(config.VALID_FILE):
-        raise FileNotFoundError(
-            f"Data files not found at {config.TRAIN_FILE} or {config.VALID_FILE}"
+    try:
+        if is_main_process(rank):
+            print(f"Using {device}")
+            if distributed:
+                print(f"DDP enabled across {world_size} GPUs.")
+            elif args.multi_gpu and device.type == "cuda":
+                visible_gpu_count = len([gpu for gpu in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if gpu])
+                if visible_gpu_count > 1:
+                    print(f"Requested multi-GPU run on {visible_gpu_count} visible GPUs.")
+            if amp_enabled:
+                print("AMP enabled.")
+
+        if not os.path.exists(config.TRAIN_FILE) or not os.path.exists(config.VALID_FILE):
+            raise FileNotFoundError(
+                f"Data files not found at {config.TRAIN_FILE} or {config.VALID_FILE}"
+            )
+
+        if is_main_process(rank):
+            print(f"Loading training CSV: {config.TRAIN_FILE}")
+        train_df = pd.read_csv(config.TRAIN_FILE, sep=";")
+        if is_main_process(rank):
+            print(f"Loading validation CSV: {config.VALID_FILE}")
+        valid_df = pd.read_csv(config.VALID_FILE, sep=";")
+        if is_main_process(rank):
+            print(f"Loaded {len(train_df)} training rows and {len(valid_df)} validation rows.")
+            print("Precomputing normalized landmark features...")
+
+        train_dataset = GazeDataset(train_df, config, True)
+        valid_dataset = GazeDataset(valid_df, config, False)
+        del train_df
+        del valid_df
+
+        train_sampler = None
+        valid_sampler = None
+        if distributed:
+            train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+            valid_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+
+        pin_memory = device.type == "cuda"
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.BATCH_SIZE,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+        )
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_size=config.BATCH_SIZE,
+            shuffle=False,
+            sampler=valid_sampler,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+        )
+        if is_main_process(rank):
+            print("Data loaders ready.")
+
+        input_dim = len(config.LANDMARK_INDICES) * 2
+        model = GazeNetVector(
+            input_dim,
+            output_size=3,
+            hidden_width=config.HIDDEN_WIDTH,
+            num_blocks=config.NUM_BLOCKS,
+            dropout_rate=config.DROPOUT_RATE,
+        ).to(device)
+        model = maybe_parallelize(
+            model,
+            device=device,
+            use_dataparallel=args.multi_gpu,
+            use_distributed=distributed,
         )
 
-    print(f"Loading training CSV: {config.TRAIN_FILE}")
-    train_df = pd.read_csv(config.TRAIN_FILE, sep=";")
-    print(f"Loading validation CSV: {config.VALID_FILE}")
-    valid_df = pd.read_csv(config.VALID_FILE, sep=";")
-    print(f"Loaded {len(train_df)} training rows and {len(valid_df)} validation rows.")
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.LEARNING_RATE,
+            weight_decay=config.WEIGHT_DECAY,
+        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=config.SCHEDULER_FACTOR,
+            patience=config.SCHEDULER_PATIENCE,
+        )
+        criterion = GazeAngularLoss()
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
-    print("Precomputing normalized landmark features...")
-    train_dataset = GazeDataset(train_df, config, True)
-    valid_dataset = GazeDataset(valid_df, config, False)
-    del train_df
-    del valid_df
+        if is_main_process(rank):
+            print("Starting Training (Vector Regression)...")
+            print("\n--- Starting Training ---")
 
-    pin_memory = device.type == "cuda"
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
-    )
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
-    )
-    print("Data loaders ready.")
+        best_error = float("inf")
+        epochs_no_improve = 0
+        os.makedirs(os.path.dirname(config.MODEL_SAVE_PATH), exist_ok=True)
 
-    input_dim = len(config.LANDMARK_INDICES) * 2
-    model = GazeNetVector(
-        input_dim,
-        output_size=3,
-        hidden_width=config.HIDDEN_WIDTH,
-        num_blocks=config.NUM_BLOCKS,
-        dropout_rate=config.DROPOUT_RATE,
-    ).to(device)
-    model = maybe_dataparallel(model, device, args.multi_gpu)
+        for epoch in range(config.NUM_EPOCHS):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.LEARNING_RATE,
-        weight_decay=config.WEIGHT_DECAY,
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=config.SCHEDULER_FACTOR,
-        patience=config.SCHEDULER_PATIENCE,
-    )
-    criterion = GazeAngularLoss()
-
-    print("Starting Training (Vector Regression)...")
-    best_error = float("inf")
-    epochs_no_improve = 0
-    os.makedirs(os.path.dirname(config.MODEL_SAVE_PATH), exist_ok=True)
-
-    print("\n--- Starting Training ---")
-    for epoch in range(config.NUM_EPOCHS):
-        model.train()
-        train_losses = []
-        for x_batch, y_batch in train_loader:
-            x_batch = x_batch.to(device, non_blocking=pin_memory)
-            y_batch = y_batch.to(device, non_blocking=pin_memory)
-
-            optimizer.zero_grad()
-            pred = model(x_batch)
-            loss = criterion(pred, y_batch)
-            loss.backward()
-            optimizer.step()
-            train_losses.append(loss.item())
-
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for x_batch, y_batch in valid_loader:
+            model.train()
+            train_loss_sum = 0.0
+            train_sample_count = 0
+            for x_batch, y_batch in train_loader:
                 x_batch = x_batch.to(device, non_blocking=pin_memory)
                 y_batch = y_batch.to(device, non_blocking=pin_memory)
-                pred = model(x_batch)
-                loss = criterion(pred, y_batch)
-                val_losses.append(loss.item())
 
-        avg_train = np.mean(train_losses)
-        avg_val = np.mean(val_losses)
-        print(f"Epoch {epoch + 1:03d} | Train Error: {avg_train:.2f} deg | Val Error: {avg_val:.2f} deg")
-        scheduler.step(avg_val)
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+                    pred = model(x_batch)
+                loss = criterion(pred.float(), y_batch.float())
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
-        if avg_val < best_error:
-            best_error = avg_val
-            epochs_no_improve = 0
-            torch.save(unwrap_state_dict(model), config.MODEL_SAVE_PATH)
-            print(f"  > New best model saved! Val Error: {avg_val:.3f} deg")
-        else:
-            epochs_no_improve += 1
+                batch_size = y_batch.size(0)
+                train_loss_sum += loss.detach().item() * batch_size
+                train_sample_count += batch_size
 
-        if epochs_no_improve >= config.PATIENCE:
-            print(
-                f"\nEarly stopping triggered at epoch {epoch + 1} after {config.PATIENCE} epochs with no improvement."
+            train_loss_sum, train_sample_count = reduce_sum_and_count(
+                train_loss_sum,
+                train_sample_count,
+                device=device,
+                distributed=distributed,
             )
-            break
 
-    print("\n--- Training Complete ---")
-    print(f"Best validation angular error: {best_error:.3f} deg")
-    print(f"Best model saved to: {config.MODEL_SAVE_PATH}")
+            model.eval()
+            val_loss_sum = 0.0
+            val_sample_count = 0
+            with torch.no_grad():
+                for x_batch, y_batch in valid_loader:
+                    x_batch = x_batch.to(device, non_blocking=pin_memory)
+                    y_batch = y_batch.to(device, non_blocking=pin_memory)
+                    with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
+                        pred = model(x_batch)
+                    loss = criterion(pred.float(), y_batch.float())
+                    batch_size = y_batch.size(0)
+                    val_loss_sum += loss.detach().item() * batch_size
+                    val_sample_count += batch_size
+
+            val_loss_sum, val_sample_count = reduce_sum_and_count(
+                val_loss_sum,
+                val_sample_count,
+                device=device,
+                distributed=distributed,
+            )
+
+            avg_train = train_loss_sum / max(train_sample_count, 1)
+            avg_val = val_loss_sum / max(val_sample_count, 1)
+            scheduler.step(avg_val)
+
+            if is_main_process(rank):
+                print(
+                    f"Epoch {epoch + 1:03d} | Train Error: {avg_train:.2f} deg | Val Error: {avg_val:.2f} deg"
+                )
+
+            if avg_val < best_error:
+                best_error = avg_val
+                epochs_no_improve = 0
+                if is_main_process(rank):
+                    torch.save(unwrap_state_dict(model), config.MODEL_SAVE_PATH)
+                    print(f"  > New best model saved! Val Error: {avg_val:.3f} deg")
+            else:
+                epochs_no_improve += 1
+
+            if epochs_no_improve >= config.PATIENCE:
+                if is_main_process(rank):
+                    print(
+                        f"\nEarly stopping triggered at epoch {epoch + 1} after {config.PATIENCE} epochs with no improvement."
+                    )
+                break
+
+        if is_main_process(rank):
+            print("\n--- Training Complete ---")
+            print(f"Best validation angular error: {best_error:.3f} deg")
+            print(f"Best model saved to: {config.MODEL_SAVE_PATH}")
+    finally:
+        cleanup_runtime(distributed)
 
 
 if __name__ == "__main__":
