@@ -138,77 +138,77 @@ def unwrap_state_dict(model: nn.Module):
 
 class SiameseGazeDataset(Dataset):
     def __init__(self, data_frame: pd.DataFrame, config: Config, is_train: bool = False):
-        self.data_frame = data_frame
         self.config = config
         self.is_train = is_train
 
-        self.l_cols_x = [f"{idx}_x" for idx in config.LEFT_EYE_LANDMARKS]
-        self.l_cols_y = [f"{idx}_y" for idx in config.LEFT_EYE_LANDMARKS]
-        self.r_cols_x = [f"{idx}_x" for idx in config.RIGHT_EYE_LANDMARKS]
-        self.r_cols_y = [f"{idx}_y" for idx in config.RIGHT_EYE_LANDMARKS]
-        self.h_cols_x = [f"{idx}_x" for idx in config.HEAD_ANCHORS]
-        self.h_cols_y = [f"{idx}_y" for idx in config.HEAD_ANCHORS]
+        l_cols_x = [f"{idx}_x" for idx in config.LEFT_EYE_LANDMARKS]
+        l_cols_y = [f"{idx}_y" for idx in config.LEFT_EYE_LANDMARKS]
+        r_cols_x = [f"{idx}_x" for idx in config.RIGHT_EYE_LANDMARKS]
+        r_cols_y = [f"{idx}_y" for idx in config.RIGHT_EYE_LANDMARKS]
+        h_cols_x = [f"{idx}_x" for idx in config.HEAD_ANCHORS]
+        h_cols_y = [f"{idx}_y" for idx in config.HEAD_ANCHORS]
 
-        self.l_in_x = f"{config.LEFT_INNER_CORNER}_x"
-        self.l_in_y = f"{config.LEFT_INNER_CORNER}_y"
-        self.l_out_x = f"{config.LEFT_OUTER_CORNER}_x"
-        self.l_out_y = f"{config.LEFT_OUTER_CORNER}_y"
-        self.r_in_x = f"{config.RIGHT_INNER_CORNER}_x"
-        self.r_in_y = f"{config.RIGHT_INNER_CORNER}_y"
-        self.r_out_x = f"{config.RIGHT_OUTER_CORNER}_x"
-        self.r_out_y = f"{config.RIGHT_OUTER_CORNER}_y"
+        l_xs = data_frame[l_cols_x].to_numpy(dtype=np.float32)
+        l_ys = data_frame[l_cols_y].to_numpy(dtype=np.float32)
+        r_xs = data_frame[r_cols_x].to_numpy(dtype=np.float32)
+        r_ys = data_frame[r_cols_y].to_numpy(dtype=np.float32)
+
+        l_in = data_frame[[f"{config.LEFT_INNER_CORNER}_x", f"{config.LEFT_INNER_CORNER}_y"]].to_numpy(
+            dtype=np.float32
+        )
+        l_out = data_frame[[f"{config.LEFT_OUTER_CORNER}_x", f"{config.LEFT_OUTER_CORNER}_y"]].to_numpy(
+            dtype=np.float32
+        )
+        r_in = data_frame[[f"{config.RIGHT_INNER_CORNER}_x", f"{config.RIGHT_INNER_CORNER}_y"]].to_numpy(
+            dtype=np.float32
+        )
+        r_out = data_frame[[f"{config.RIGHT_OUTER_CORNER}_x", f"{config.RIGHT_OUTER_CORNER}_y"]].to_numpy(
+            dtype=np.float32
+        )
+
+        l_center_x = (l_in[:, [0]] + l_out[:, [0]]) / 2.0
+        l_center_y = (l_in[:, [1]] + l_out[:, [1]]) / 2.0
+        r_center_x = (r_in[:, [0]] + r_out[:, [0]]) / 2.0
+        r_center_y = (r_in[:, [1]] + r_out[:, [1]]) / 2.0
+
+        self.feat_left = np.empty((len(data_frame), len(config.LEFT_EYE_LANDMARKS) * 2), dtype=np.float32)
+        self.feat_left[:, 0::2] = (l_xs - l_center_x) / config.SCALE_FACTOR
+        self.feat_left[:, 1::2] = (l_ys - l_center_y) / config.SCALE_FACTOR
+
+        self.feat_right = np.empty((len(data_frame), len(config.RIGHT_EYE_LANDMARKS) * 2), dtype=np.float32)
+        self.feat_right[:, 0::2] = (r_xs - r_center_x) / config.SCALE_FACTOR
+        self.feat_right[:, 1::2] = (r_ys - r_center_y) / config.SCALE_FACTOR
+
+        avg_scale = config.SCALE_FACTOR
+        self.relative_pos = np.empty((len(data_frame), 2), dtype=np.float32)
+        self.relative_pos[:, 0] = ((r_center_x - l_center_x)[:, 0]) / avg_scale
+        self.relative_pos[:, 1] = ((r_center_y - l_center_y)[:, 0]) / avg_scale
+
+        head_x = data_frame[h_cols_x].to_numpy(dtype=np.float32)
+        head_y = data_frame[h_cols_y].to_numpy(dtype=np.float32)
+        face_center_x = (l_center_x + r_center_x) / 2.0
+        face_center_y = (l_center_y + r_center_y) / 2.0
+        head_xn = (head_x - face_center_x) / avg_scale
+        head_yn = (head_y - face_center_y) / avg_scale
+
+        self.feat_head = np.empty((len(data_frame), len(config.HEAD_ANCHORS) * 2), dtype=np.float32)
+        self.feat_head[:, 0::2] = head_xn
+        self.feat_head[:, 1::2] = head_yn
+
+        self.targets = data_frame[["gaze_x", "gaze_y", "gaze_z"]].to_numpy(dtype=np.float32)
+        self.targets /= np.clip(np.linalg.norm(self.targets, axis=1, keepdims=True), 1e-8, None)
 
     def __len__(self) -> int:
-        return len(self.data_frame)
-
-    def _process_eye(self, xs, ys, inner_pt, outer_pt):
-        centroid_x = (inner_pt[0] + outer_pt[0]) / 2.0
-        centroid_y = (inner_pt[1] + outer_pt[1]) / 2.0
-        xs_norm = (xs - centroid_x) / self.config.SCALE_FACTOR
-        ys_norm = (ys - centroid_y) / self.config.SCALE_FACTOR
-
-        features = np.empty((len(xs) * 2,), dtype=np.float32)
-        features[0::2] = xs_norm
-        features[1::2] = ys_norm
-        return features, (centroid_x, centroid_y), self.config.SCALE_FACTOR
+        return len(self.targets)
 
     def __getitem__(self, idx: int):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
-        row = self.data_frame.iloc[idx]
-        l_xs = row[self.l_cols_x].values.astype(np.float32)
-        l_ys = row[self.l_cols_y].values.astype(np.float32)
-        r_xs = row[self.r_cols_x].values.astype(np.float32)
-        r_ys = row[self.r_cols_y].values.astype(np.float32)
-
-        l_in = (row[self.l_in_x], row[self.l_in_y])
-        l_out = (row[self.l_out_x], row[self.l_out_y])
-        r_in = (row[self.r_in_x], row[self.r_in_y])
-        r_out = (row[self.r_out_x], row[self.r_out_y])
-
-        feat_left, l_center, l_scale = self._process_eye(l_xs, l_ys, l_in, l_out)
-        feat_right, r_center, r_scale = self._process_eye(r_xs, r_ys, r_in, r_out)
-
-        avg_scale = (l_scale + r_scale) / 2.0
-        relative_pos = np.array(
-            [
-                (r_center[0] - l_center[0]) / avg_scale,
-                (r_center[1] - l_center[1]) / avg_scale,
-            ],
-            dtype=np.float32,
-        )
-
-        head_x = row[self.h_cols_x].values.astype(np.float32)
-        head_y = row[self.h_cols_y].values.astype(np.float32)
-        face_center_x = (l_center[0] + r_center[0]) / 2.0
-        face_center_y = (l_center[1] + r_center[1]) / 2.0
-        head_xn = (head_x - face_center_x) / avg_scale
-        head_yn = (head_y - face_center_y) / avg_scale
-
-        feat_head = np.empty((len(head_x) * 2,), dtype=np.float32)
-        feat_head[0::2] = head_xn
-        feat_head[1::2] = head_yn
+        feat_left = self.feat_left[idx].copy() if self.is_train else self.feat_left[idx]
+        feat_right = self.feat_right[idx].copy() if self.is_train else self.feat_right[idx]
+        feat_head = self.feat_head[idx].copy() if self.is_train else self.feat_head[idx]
+        relative_pos = self.relative_pos[idx]
 
         if self.is_train and self.config.AUGMENTATION_NOISE_STD > 0:
             noise_l = np.random.normal(0, self.config.AUGMENTATION_NOISE_STD, feat_left.shape).astype(np.float32)
@@ -218,15 +218,14 @@ class SiameseGazeDataset(Dataset):
             feat_right += noise_r
             feat_head += noise_h
 
-        target = np.array([row["gaze_x"], row["gaze_y"], row["gaze_z"]], dtype=np.float32)
-        target /= np.linalg.norm(target)
+        target = self.targets[idx]
 
         return (
-            torch.tensor(feat_left),
-            torch.tensor(feat_right),
-            torch.tensor(relative_pos),
-            torch.tensor(feat_head),
-            torch.tensor(target),
+            torch.from_numpy(feat_left),
+            torch.from_numpy(feat_right),
+            torch.from_numpy(relative_pos),
+            torch.from_numpy(feat_head),
+            torch.from_numpy(target),
         )
 
 
@@ -334,24 +333,34 @@ def main() -> None:
             f"Data files not found at {config.TRAIN_FILE} or {config.VALID_FILE}"
         )
 
+    print(f"Loading training CSV: {config.TRAIN_FILE}")
     train_df = pd.read_csv(config.TRAIN_FILE, sep=";")
+    print(f"Loading validation CSV: {config.VALID_FILE}")
     valid_df = pd.read_csv(config.VALID_FILE, sep=";")
+    print(f"Loaded {len(train_df)} training rows and {len(valid_df)} validation rows.")
+
+    print("Precomputing normalized landmark features...")
+    train_dataset = SiameseGazeDataset(train_df, config, True)
+    valid_dataset = SiameseGazeDataset(valid_df, config, False)
+    del train_df
+    del valid_df
 
     pin_memory = device.type == "cuda"
     train_loader = DataLoader(
-        SiameseGazeDataset(train_df, config, True),
+        train_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
     )
     valid_loader = DataLoader(
-        SiameseGazeDataset(valid_df, config, False),
+        valid_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
     )
+    print("Data loaders ready.")
 
     input_dim_eye = len(config.LEFT_EYE_LANDMARKS) * 2
     model = SiameseGazeNet(input_dim_eye, config).to(device)

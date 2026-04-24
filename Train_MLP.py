@@ -136,43 +136,45 @@ def unwrap_state_dict(model: nn.Module):
 
 class GazeDataset(Dataset):
     def __init__(self, data_frame: pd.DataFrame, config: Config, is_train: bool = False):
-        self.data_frame = data_frame
         self.config = config
         self.is_train = is_train
 
-        self.lm_cols_x = [f"{idx}_x" for idx in config.LANDMARK_INDICES]
-        self.lm_cols_y = [f"{idx}_y" for idx in config.LANDMARK_INDICES]
+        lm_cols_x = [f"{idx}_x" for idx in config.LANDMARK_INDICES]
+        lm_cols_y = [f"{idx}_y" for idx in config.LANDMARK_INDICES]
         eye_anchor_ids = [
             config.LEFT_INNER_CORNER,
             config.LEFT_OUTER_CORNER,
             config.RIGHT_INNER_CORNER,
             config.RIGHT_OUTER_CORNER,
         ]
-        self.eye_lm_cols_x = [f"{idx}_x" for idx in eye_anchor_ids]
-        self.eye_lm_cols_y = [f"{idx}_y" for idx in eye_anchor_ids]
+        eye_lm_cols_x = [f"{idx}_x" for idx in eye_anchor_ids]
+        eye_lm_cols_y = [f"{idx}_y" for idx in eye_anchor_ids]
+
+        xs = data_frame[lm_cols_x].to_numpy(dtype=np.float32)
+        ys = data_frame[lm_cols_y].to_numpy(dtype=np.float32)
+        xs_eye = data_frame[eye_lm_cols_x].to_numpy(dtype=np.float32)
+        ys_eye = data_frame[eye_lm_cols_y].to_numpy(dtype=np.float32)
+
+        centroid_x = np.mean(xs_eye, axis=1, keepdims=True)
+        centroid_y = np.mean(ys_eye, axis=1, keepdims=True)
+        xs_norm = (xs - centroid_x) / config.SCALE_FACTOR
+        ys_norm = (ys - centroid_y) / config.SCALE_FACTOR
+
+        self.features = np.empty((len(data_frame), len(config.LANDMARK_INDICES) * 2), dtype=np.float32)
+        self.features[:, 0::2] = xs_norm
+        self.features[:, 1::2] = ys_norm
+
+        self.targets = data_frame[["gaze_x", "gaze_y", "gaze_z"]].to_numpy(dtype=np.float32)
+        self.targets /= np.clip(np.linalg.norm(self.targets, axis=1, keepdims=True), 1e-8, None)
 
     def __len__(self) -> int:
-        return len(self.data_frame)
+        return len(self.features)
 
     def __getitem__(self, idx: int):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
-        row = self.data_frame.iloc[idx]
-
-        xs = row[self.lm_cols_x].values.astype(np.float32)
-        ys = row[self.lm_cols_y].values.astype(np.float32)
-        xs_eye = row[self.eye_lm_cols_x].values.astype(np.float32)
-        ys_eye = row[self.eye_lm_cols_y].values.astype(np.float32)
-
-        centroid_x = np.mean(xs_eye)
-        centroid_y = np.mean(ys_eye)
-        xs_norm = (xs - centroid_x) / self.config.SCALE_FACTOR
-        ys_norm = (ys - centroid_y) / self.config.SCALE_FACTOR
-
-        features = np.empty((len(xs) * 2,), dtype=np.float32)
-        features[0::2] = xs_norm
-        features[1::2] = ys_norm
+        features = self.features[idx].copy() if self.is_train else self.features[idx]
 
         if self.is_train and self.config.AUGMENTATION_NOISE_STD > 0:
             noise = np.random.normal(
@@ -182,10 +184,8 @@ class GazeDataset(Dataset):
             ).astype(np.float32)
             features += noise
 
-        target = np.array([row["gaze_x"], row["gaze_y"], row["gaze_z"]], dtype=np.float32)
-        target /= np.linalg.norm(target)
-
-        return torch.tensor(features), torch.tensor(target)
+        target = self.targets[idx]
+        return torch.from_numpy(features), torch.from_numpy(target)
 
 
 class ResidualBlock(nn.Module):
@@ -264,24 +264,34 @@ def main() -> None:
             f"Data files not found at {config.TRAIN_FILE} or {config.VALID_FILE}"
         )
 
+    print(f"Loading training CSV: {config.TRAIN_FILE}")
     train_df = pd.read_csv(config.TRAIN_FILE, sep=";")
+    print(f"Loading validation CSV: {config.VALID_FILE}")
     valid_df = pd.read_csv(config.VALID_FILE, sep=";")
+    print(f"Loaded {len(train_df)} training rows and {len(valid_df)} validation rows.")
+
+    print("Precomputing normalized landmark features...")
+    train_dataset = GazeDataset(train_df, config, True)
+    valid_dataset = GazeDataset(valid_df, config, False)
+    del train_df
+    del valid_df
 
     pin_memory = device.type == "cuda"
     train_loader = DataLoader(
-        GazeDataset(train_df, config, True),
+        train_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
     )
     valid_loader = DataLoader(
-        GazeDataset(valid_df, config, False),
+        valid_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
     )
+    print("Data loaders ready.")
 
     input_dim = len(config.LANDMARK_INDICES) * 2
     model = GazeNetVector(
