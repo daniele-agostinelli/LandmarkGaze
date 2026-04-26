@@ -32,14 +32,14 @@ class Config:
     VALID_FILE = DEFAULT_DATASET.valid_file
     MODEL_SAVE_PATH = "models/gaze360_siameseMLP.pth"
 
-    BRANCH_HIDDEN_WIDTH = 64
-    FUSION_HIDDEN_WIDTH = 128
+    BRANCH_HIDDEN_WIDTH = 128
+    FUSION_HIDDEN_WIDTH = 256
     NUM_BLOCKS = 3
-    DROPOUT_RATE = 0.1
+    DROPOUT_RATE = 0.2
 
     BATCH_SIZE = 64
-    LEARNING_RATE = 0.001
-    WEIGHT_DECAY = 1e-4
+    LEARNING_RATE = 3e-4
+    WEIGHT_DECAY = 5e-4
     NUM_EPOCHS = 200
     PATIENCE = 15
     RANDOM_STATE = 42
@@ -47,6 +47,8 @@ class Config:
     SCHEDULER_FACTOR = 0.5
     SCHEDULER_PATIENCE = 5
     AUGMENTATION_NOISE_STD = 0.0
+    SHARE_EYE_ENCODER = True
+    USE_INTERACTION_FUSION = True
 
     LEFT_IRIS = [468, 469, 470, 471, 472]
     RIGHT_IRIS = [473, 474, 475, 476, 477]
@@ -351,21 +353,35 @@ class SiameseGazeNet(nn.Module):
     def __init__(self, input_size_per_eye: int, config: Config):
         super().__init__()
 
-        self.left_branch = EyeEncoder(
-            input_size_per_eye,
-            config.BRANCH_HIDDEN_WIDTH,
-            config.NUM_BLOCKS,
-            config.DROPOUT_RATE,
-        )
-        self.right_branch = EyeEncoder(
-            input_size_per_eye,
-            config.BRANCH_HIDDEN_WIDTH,
-            config.NUM_BLOCKS,
-            config.DROPOUT_RATE,
-        )
+        self.share_eye_encoder = bool(getattr(config, "SHARE_EYE_ENCODER", False))
+        self.use_interaction_fusion = bool(getattr(config, "USE_INTERACTION_FUSION", False))
+
+        if self.share_eye_encoder:
+            self.eye_encoder = EyeEncoder(
+                input_size_per_eye,
+                config.BRANCH_HIDDEN_WIDTH,
+                config.NUM_BLOCKS,
+                config.DROPOUT_RATE,
+            )
+        else:
+            self.left_branch = EyeEncoder(
+                input_size_per_eye,
+                config.BRANCH_HIDDEN_WIDTH,
+                config.NUM_BLOCKS,
+                config.DROPOUT_RATE,
+            )
+            self.right_branch = EyeEncoder(
+                input_size_per_eye,
+                config.BRANCH_HIDDEN_WIDTH,
+                config.NUM_BLOCKS,
+                config.DROPOUT_RATE,
+            )
 
         head_input_dim = len(config.HEAD_ANCHORS) * 2
-        fusion_input_dim = config.BRANCH_HIDDEN_WIDTH * 2 + 2 + head_input_dim
+        if self.use_interaction_fusion:
+            fusion_input_dim = config.BRANCH_HIDDEN_WIDTH * 4 + 2 + head_input_dim
+        else:
+            fusion_input_dim = config.BRANCH_HIDDEN_WIDTH * 2 + 2 + head_input_dim
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, config.FUSION_HIDDEN_WIDTH),
             nn.BatchNorm1d(config.FUSION_HIDDEN_WIDTH),
@@ -373,8 +389,22 @@ class SiameseGazeNet(nn.Module):
             nn.Dropout(config.DROPOUT_RATE),
             nn.Linear(config.FUSION_HIDDEN_WIDTH, config.FUSION_HIDDEN_WIDTH // 2),
             nn.GELU(),
-            nn.Linear(config.FUSION_HIDDEN_WIDTH // 2, 3),
+            nn.Dropout(config.DROPOUT_RATE),
+            nn.Linear(config.FUSION_HIDDEN_WIDTH // 2, config.FUSION_HIDDEN_WIDTH // 4),
+            nn.GELU(),
+            nn.Linear(config.FUSION_HIDDEN_WIDTH // 4, 3),
         )
+
+    def _canonicalize_right_eye(self, x_right: torch.Tensor) -> torch.Tensor:
+        x_right = x_right.clone()
+        x_right[:, 0::2] = -x_right[:, 0::2]
+        return x_right
+
+    def _encode_eyes(self, x_left: torch.Tensor, x_right: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.share_eye_encoder:
+            x_right = self._canonicalize_right_eye(x_right)
+            return self.eye_encoder(x_left), self.eye_encoder(x_right)
+        return self.left_branch(x_left), self.right_branch(x_right)
 
     def forward(
         self,
@@ -383,9 +413,17 @@ class SiameseGazeNet(nn.Module):
         rel_pos: torch.Tensor,
         head_anchors: torch.Tensor,
     ) -> torch.Tensor:
-        l_feat = self.left_branch(x_left)
-        r_feat = self.right_branch(x_right)
-        return self.fusion(torch.cat([l_feat, r_feat, rel_pos, head_anchors], dim=1))
+        l_feat, r_feat = self._encode_eyes(x_left, x_right)
+        if self.use_interaction_fusion:
+            pair_features = [
+                l_feat,
+                r_feat,
+                torch.abs(l_feat - r_feat),
+                l_feat * r_feat,
+            ]
+        else:
+            pair_features = [l_feat, r_feat]
+        return self.fusion(torch.cat(pair_features + [rel_pos, head_anchors], dim=1))
 
 
 class GazeAngularLoss(nn.Module):
