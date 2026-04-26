@@ -105,40 +105,21 @@ class GazeEstimatorNormalizedSiamese:
             raise e
 
     def _infer_model_shape_from_state_dict(self, state_dict):
-        shared_key = "eye_encoder.input.0.weight"
-        legacy_key = "left_branch.input.0.weight"
+        key_in = "left_branch.input.0.weight"
         key_fusion = "fusion.0.weight"
-        if key_fusion not in state_dict or (shared_key not in state_dict and legacy_key not in state_dict):
+        if key_in not in state_dict or key_fusion not in state_dict:
             raise RuntimeError(
                 "Checkpoint missing required keys for Siamese shape inference: "
-                f"{shared_key} or {legacy_key}, plus {key_fusion}"
+                f"{key_in}, {key_fusion}"
             )
 
-        share_eye_encoder = shared_key in state_dict
-        encoder_key = shared_key if share_eye_encoder else legacy_key
-
-        input_size_per_eye = int(state_dict[encoder_key].shape[1])
-        branch_hidden = int(state_dict[encoder_key].shape[0])
+        input_size_per_eye = int(state_dict[key_in].shape[1])
+        branch_hidden = int(state_dict[key_in].shape[0])
         fusion_hidden = int(state_dict[key_fusion].shape[0])
-        head_input_dim = len(SiameseTrainConfig.HEAD_ANCHORS) * 2
-        legacy_fusion_dim = branch_hidden * 2 + 2 + head_input_dim
-        interaction_fusion_dim = branch_hidden * 4 + 2 + head_input_dim
-        actual_fusion_dim = int(state_dict[key_fusion].shape[1])
-
-        if actual_fusion_dim == interaction_fusion_dim:
-            use_interaction_fusion = True
-        elif actual_fusion_dim == legacy_fusion_dim:
-            use_interaction_fusion = False
-        else:
-            raise RuntimeError(
-                "Unable to infer Siamese fusion layout from checkpoint: "
-                f"expected {legacy_fusion_dim} or {interaction_fusion_dim} inputs, got {actual_fusion_dim}."
-            )
 
         block_ids = set()
-        block_prefix = "eye_encoder.blocks." if share_eye_encoder else "left_branch.blocks."
         for key in state_dict.keys():
-            if not key.startswith(block_prefix):
+            if not key.startswith("left_branch.blocks."):
                 continue
             parts = key.split(".")
             if len(parts) < 3:
@@ -154,8 +135,6 @@ class GazeEstimatorNormalizedSiamese:
         model_cfg.FUSION_HIDDEN_WIDTH = fusion_hidden
         model_cfg.NUM_BLOCKS = num_blocks
         model_cfg.DROPOUT_RATE = float(SiameseTrainConfig.DROPOUT_RATE)
-        model_cfg.SHARE_EYE_ENCODER = share_eye_encoder
-        model_cfg.USE_INTERACTION_FUSION = use_interaction_fusion
         return input_size_per_eye, model_cfg
 
     def detect_faces(self, image: np.ndarray) -> List[Face]:
